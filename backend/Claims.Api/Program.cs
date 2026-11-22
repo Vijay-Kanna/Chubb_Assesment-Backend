@@ -1,6 +1,8 @@
 using System.Text.Json.Serialization;
 using System.Threading.RateLimiting;
 using System.IdentityModel.Tokens.Jwt;
+using Chubb.ApiDocumentation;
+using Chubb.Realtime;
 using Claims.Api.Application;
 using Claims.Api.Auth;
 using Claims.Api.Domain;
@@ -9,12 +11,15 @@ using Claims.Api.Messaging;
 using Claims.Api.Persistence;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.AspNetCore.Identity;
+using Microsoft.AspNetCore.SignalR;
 using Microsoft.EntityFrameworkCore;
 
 var builder = WebApplication.CreateBuilder(args);
+const string apiTitle = "Claims API";
 
 builder.Services.AddProblemDetails();
-builder.Services.AddOpenApi();
+builder.Services.Configure<RouteHandlerOptions>(options => options.ThrowOnBadRequest = false);
+builder.Services.AddAssessmentOpenApi(apiTitle);
 builder.Services.ConfigureHttpJsonOptions(options =>
     options.SerializerOptions.Converters.Add(new JsonStringEnumConverter(allowIntegerValues: false)));
 builder.Services.AddDbContext<ClaimsDbContext>((services, options) =>
@@ -29,6 +34,10 @@ builder.Services.AddSingleton<JwtTokens>();
 builder.Services.AddScoped<IPasswordHasher<User>, PasswordHasher<User>>();
 builder.Services.AddScoped<LoginService>();
 builder.Services.AddScoped<ClaimsService>();
+builder.Services.AddScoped<ReportsService>();
+builder.Services.AddSignalR();
+builder.Services.AddSingleton<IUserIdProvider, SubjectUserIdProvider>();
+builder.Services.AddSingleton<ClaimUpdates>();
 builder.Services.AddHostedService<ClaimNotificationPublisher>();
 
 builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme).AddJwtBearer();
@@ -39,6 +48,8 @@ builder.Services.AddOptions<JwtBearerOptions>(JwtBearerDefaults.AuthenticationSc
         options.TokenValidationParameters = tokens.Validation;
         options.Events = new JwtBearerEvents
         {
+            OnMessageReceived = context => RealtimeAuthentication.ReadToken(context, ClaimsHub.Path,
+                builder.Configuration["BrowserSession:Origin"], builder.Environment.IsDevelopment()),
             OnTokenValidated = context =>
             {
                 if (!Guid.TryParse(context.Principal?.FindFirst(JwtRegisteredClaimNames.Sub)?.Value, out _))
@@ -74,10 +85,11 @@ app.UseRateLimiter();
 app.UseAuthentication();
 app.UseAuthorization();
 
-if (app.Environment.IsDevelopment())
-    app.MapOpenApi();
+app.UseAssessmentSwagger(apiTitle);
 app.MapLogin();
 app.MapClaims();
+app.MapReports();
+app.MapHub<ClaimsHub>(ClaimsHub.Path, options => options.CloseOnAuthenticationExpiration = true);
 
 await using (var scope = app.Services.CreateAsyncScope())
 {

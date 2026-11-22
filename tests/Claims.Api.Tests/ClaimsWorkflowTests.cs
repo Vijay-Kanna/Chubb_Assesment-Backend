@@ -2,18 +2,23 @@ using System.Net;
 using System.Net.Http.Headers;
 using System.Net.Http.Json;
 using System.Text.Json;
+using Claims.Api.Persistence;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
+using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.DependencyInjection;
 
 namespace Claims.Api.Tests;
 
 public sealed class ClaimsWorkflowTests : IClassFixture<ClaimsApiFactory>
 {
     private readonly HttpClient client;
+    private readonly ClaimsApiFactory factory;
 
     public ClaimsWorkflowTests(ClaimsApiFactory factory)
     {
+        this.factory = factory;
         client = factory.CreateClient(new WebApplicationFactoryClientOptions
         {
             BaseAddress = new Uri("https://localhost"),
@@ -32,6 +37,52 @@ public sealed class ClaimsWorkflowTests : IClassFixture<ClaimsApiFactory>
         using var response = await client.PostAsJsonAsync("/auth/login",
             new { email = "claimant@example.test", password = "incorrect" });
         Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task Browser_session_restores_and_clears_the_cookie_and_requires_a_header_for_writes()
+    {
+        using var browser = factory.CreateClient(new WebApplicationFactoryClientOptions
+        {
+            BaseAddress = new Uri("https://localhost"),
+            AllowAutoRedirect = false,
+            HandleCookies = true
+        });
+        const string path = "/auth/session";
+        const string header = "X-Claims-Workspace";
+        using var login = new HttpRequestMessage(HttpMethod.Post, path)
+        {
+            Content = JsonContent.Create(new { email = "claimant@example.test", password = ClaimsApiFactory.DemoPassword })
+        };
+        login.Headers.Add(header, "1");
+        using var signedIn = await browser.SendAsync(login);
+        Assert.Equal(HttpStatusCode.OK, signedIn.StatusCode);
+        var cookie = Assert.Single(signedIn.Headers.GetValues("Set-Cookie"));
+        Assert.StartsWith("__Host-ClaimsSession=", cookie);
+        foreach (var attribute in new[] { "path=/", "secure", "samesite=strict", "httponly" })
+            Assert.Contains(attribute, cookie, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("accessToken", (await Read(signedIn)).GetRawText());
+
+        using var restored = await browser.GetAsync(path);
+        Assert.Equal(HttpStatusCode.OK, restored.StatusCode);
+        Assert.Equal("claimant@example.test", (await Read(restored)).GetProperty("email").GetString());
+
+        using var rejectedWrite = await browser.PostAsJsonAsync("/claims", ValidClaim());
+        Assert.Equal(HttpStatusCode.Unauthorized, rejectedWrite.StatusCode);
+        using var rejectedLogout = await browser.DeleteAsync(path);
+        Assert.Equal(HttpStatusCode.Forbidden, rejectedLogout.StatusCode);
+
+        using var submit = new HttpRequestMessage(HttpMethod.Post, "/claims") { Content = JsonContent.Create(ValidClaim()) };
+        submit.Headers.Add(header, "1");
+        using var created = await browser.SendAsync(submit);
+        Assert.Equal(HttpStatusCode.Created, created.StatusCode);
+
+        using var logout = new HttpRequestMessage(HttpMethod.Delete, path);
+        logout.Headers.Add(header, "1");
+        using var signedOut = await browser.SendAsync(logout);
+        Assert.Equal(HttpStatusCode.NoContent, signedOut.StatusCode);
+        using var after = await browser.GetAsync(path);
+        Assert.Equal(HttpStatusCode.Unauthorized, after.StatusCode);
     }
 
     [Fact]
@@ -96,6 +147,26 @@ public sealed class ClaimsWorkflowTests : IClassFixture<ClaimsApiFactory>
         Assert.Equal(HttpStatusCode.NotFound, read.StatusCode);
         using var history = await Request(HttpMethod.Get, $"/claims/{id}/history", other);
         Assert.Equal(HttpStatusCode.NotFound, history.StatusCode);
+        await ExpectStatus(HttpMethod.Get, $"/claims/{id}/history?page=1&pageSize=1", other, HttpStatusCode.NotFound);
+        await ExpectStatus(HttpMethod.Get, $"/claims/{id}/messages?page=1&pageSize=1", other, HttpStatusCode.NotFound);
+
+        _ = await Submit(claimant);
+        using var firstPage = await Request(HttpMethod.Get, "/claims?status=Submitted&page=1&pageSize=1", claimant);
+        using var secondPage = await Request(HttpMethod.Get, "/claims?status=Submitted&page=2&pageSize=1", claimant);
+        Assert.Equal(HttpStatusCode.OK, firstPage.StatusCode);
+        Assert.Equal(HttpStatusCode.OK, secondPage.StatusCode);
+        var total = Assert.Single(firstPage.Headers.GetValues("X-Total-Count"));
+        Assert.True(int.Parse(total) >= 2);
+        Assert.Equal(total, Assert.Single(secondPage.Headers.GetValues("X-Total-Count")));
+        var firstItem = Assert.Single((await Read(firstPage)).EnumerateArray());
+        var secondItem = Assert.Single((await Read(secondPage)).EnumerateArray());
+        Assert.Equal("Submitted", firstItem.GetProperty("status").GetString());
+        Assert.Equal("Submitted", secondItem.GetProperty("status").GetString());
+        Assert.NotEqual(firstItem.GetProperty("id").GetGuid(), secondItem.GetProperty("id").GetGuid());
+        await ExpectStatus(HttpMethod.Get, "/claims?pageSize=501", claimant, HttpStatusCode.BadRequest);
+        using var largePage = await Request(HttpMethod.Get, "/claims?status=Submitted&pageSize=500", claimant);
+        Assert.Equal(HttpStatusCode.OK, largePage.StatusCode);
+        Assert.Equal(int.Parse(total), (await Read(largePage)).GetArrayLength());
         using var list = await Request(HttpMethod.Get, "/claims", other);
         Assert.DoesNotContain((await Read(list)).EnumerateArray(), claim => claim.GetProperty("id").GetGuid() == id);
         using var pickUp = await Request(HttpMethod.Post, $"/claims/{id}/pick-up", claimant);
@@ -167,6 +238,22 @@ public sealed class ClaimsWorkflowTests : IClassFixture<ClaimsApiFactory>
         Assert.Equal([staffId, claimantId, staffId, claimantId],
             conversation.Select(message => message.GetProperty("senderUserId").GetGuid()));
 
+        using var newest = await Request(HttpMethod.Get, $"{path}/messages?page=1&pageSize=2", staff);
+        Assert.Equal(HttpStatusCode.OK, newest.StatusCode);
+        Assert.Equal("4", Assert.Single(newest.Headers.GetValues("X-Total-Count")));
+        Assert.Equal(["When did you notice the damage?", "The following morning."],
+            (await Read(newest)).EnumerateArray().Select(message => message.GetProperty("body").GetString()));
+        using var older = await Request(HttpMethod.Get, $"{path}/messages?page=2&pageSize=2", claimant);
+        Assert.Equal(HttpStatusCode.OK, older.StatusCode);
+        Assert.Equal(["Where was the car parked?", "Outside my home."],
+            (await Read(older)).EnumerateArray().Select(message => message.GetProperty("body").GetString()));
+
+        var anchor = conversation[1].GetProperty("id").GetInt64();
+        using var anchored = await Request(HttpMethod.Get, $"{path}/messages?page=2&pageSize=1&throughMessageId={anchor}", staff);
+        Assert.Equal(HttpStatusCode.OK, anchored.StatusCode);
+        Assert.Equal("2", Assert.Single(anchored.Headers.GetValues("X-Total-Count")));
+        Assert.Equal("Where was the car parked?", Assert.Single((await Read(anchored)).EnumerateArray()).GetProperty("body").GetString());
+
         using var history = await Request(HttpMethod.Get, $"{path}/history", staff);
         Assert.Equal(HttpStatusCode.OK, history.StatusCode);
         var entries = (await Read(history)).EnumerateArray().ToArray();
@@ -177,6 +264,20 @@ public sealed class ClaimsWorkflowTests : IClassFixture<ClaimsApiFactory>
             entries[2..6].Select(entry => entry.GetProperty("claimMessageId").GetInt64()));
         Assert.Equal("Approved", entries[^1].GetProperty("previousStatus").GetString());
         Assert.Equal("Settled", entries[^1].GetProperty("newStatus").GetString());
+        using var newestHistory = await Request(HttpMethod.Get, $"{path}/history?page=1&pageSize=2", staff);
+        Assert.Equal(HttpStatusCode.OK, newestHistory.StatusCode);
+        Assert.Equal("8", Assert.Single(newestHistory.Headers.GetValues("X-Total-Count")));
+        Assert.Equal(["Settled", "Approved"],
+            (await Read(newestHistory)).EnumerateArray().Select(entry => entry.GetProperty("action").GetString()));
+        using var largeHistory = await Request(HttpMethod.Get, $"{path}/history?page=1&pageSize=250", staff);
+        Assert.Equal(HttpStatusCode.OK, largeHistory.StatusCode);
+        Assert.Equal(8, (await Read(largeHistory)).GetArrayLength());
+        using var largeMessages = await Request(HttpMethod.Get, $"{path}/messages?page=1&pageSize=500", staff);
+        Assert.Equal(HttpStatusCode.OK, largeMessages.StatusCode);
+        Assert.Equal(4, (await Read(largeMessages)).GetArrayLength());
+        using var emptyHistory = await Request(HttpMethod.Get, $"{path}/history?page=5&pageSize=2", staff);
+        Assert.Equal(HttpStatusCode.OK, emptyHistory.StatusCode);
+        Assert.Empty((await Read(emptyHistory)).EnumerateArray());
     }
 
     [Fact]
@@ -191,17 +292,42 @@ public sealed class ClaimsWorkflowTests : IClassFixture<ClaimsApiFactory>
         await ExpectStatus(HttpMethod.Post, $"{path}/questions", staff, HttpStatusCode.BadRequest, new { body = " " });
         await CheckStatus(HttpMethod.Post, $"{path}/questions", staff, "AwaitingInformation", "Is there a witness?");
         await ExpectStatus(HttpMethod.Post, $"{path}/approve", staff, HttpStatusCode.Conflict);
-        await ExpectStatus(HttpMethod.Post, $"{path}/reject", staff, HttpStatusCode.Conflict);
+        const string reason = "The assessment found the damage occurred before the policy began.";
+        var decision = new { reason };
+        await ExpectStatus(HttpMethod.Post, $"{path}/reject", staff, HttpStatusCode.Conflict, decision);
         await ExpectStatus(HttpMethod.Post, $"{path}/questions", staff, HttpStatusCode.Conflict, new { body = "A second outstanding question" });
         await CheckStatus(HttpMethod.Post, $"{path}/replies", claimant, "UnderReview", "No witness.");
-        await CheckStatus(HttpMethod.Post, $"{path}/reject", staff, "Rejected");
+        await ExpectStatus(HttpMethod.Post, $"{path}/reject", staff, HttpStatusCode.BadRequest);
+        await ExpectStatus(HttpMethod.Post, $"{path}/reject", staff, HttpStatusCode.BadRequest, new { reason = " " });
+        await ExpectStatus(HttpMethod.Post, $"{path}/reject", staff, HttpStatusCode.BadRequest, new { reason = new string('x', 1001) });
+        using var rejected = await Request(HttpMethod.Post, $"{path}/reject", staff, decision);
+        Assert.Equal(HttpStatusCode.OK, rejected.StatusCode);
         await ExpectStatus(HttpMethod.Post, $"{path}/settle", staff, HttpStatusCode.Conflict);
         await ExpectStatus(HttpMethod.Post, $"{path}/questions", staff, HttpStatusCode.Conflict, new { body = "A late question" });
-        await CheckStatus(HttpMethod.Get, path, claimant, "Rejected");
+        var rejectedClaim = await CheckStatus(HttpMethod.Get, path, claimant, "Rejected");
+        Assert.Equal(reason, rejectedClaim.GetProperty("rejectionReason").GetString());
+        await ExpectStatus(HttpMethod.Put, $"{path}/rejection-reason", staff, HttpStatusCode.Conflict, new { reason = "Changed explanation." });
+        using var conversation = await Request(HttpMethod.Get, $"{path}/messages", claimant);
+        Assert.Equal(2, (await Read(conversation)).GetArrayLength());
 
         using var history = await Request(HttpMethod.Get, $"{path}/history", claimant);
         Assert.Equal(["Submitted", "Assigned", "QuestionAsked", "ReplyReceived", "Rejected"],
             (await Read(history)).EnumerateArray().Select(entry => entry.GetProperty("action").GetString()));
+
+        // Simulate a rejected claim saved by the version that did not record a reason.
+        var claimId = rejectedClaim.GetProperty("id").GetGuid();
+        await using (var scope = factory.Services.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<ClaimsDbContext>();
+            await db.Claims.Where(claim => claim.Id == claimId)
+                .ExecuteUpdateAsync(set => set.SetProperty(claim => claim.RejectionReason, (string?)null));
+        }
+        await ExpectStatus(HttpMethod.Put, $"{path}/rejection-reason", staff, HttpStatusCode.OK, decision);
+        var updated = await CheckStatus(HttpMethod.Get, path, claimant, "Rejected");
+        Assert.Equal(reason, updated.GetProperty("rejectionReason").GetString());
+        using var updatedHistory = await Request(HttpMethod.Get, $"{path}/history", claimant);
+        Assert.Equal("RejectionReasonRecorded",
+            (await Read(updatedHistory)).EnumerateArray().Last().GetProperty("action").GetString());
     }
 
     [Fact]
@@ -227,7 +353,8 @@ public sealed class ClaimsWorkflowTests : IClassFixture<ClaimsApiFactory>
         await ExpectStatus(HttpMethod.Post, $"{path}/replies", staff, HttpStatusCode.Forbidden, message);
         await CheckStatus(HttpMethod.Post, $"{path}/replies", claimant, "UnderReview", "The bumper.");
         await ExpectStatus(HttpMethod.Post, $"{path}/approve", otherStaff, HttpStatusCode.NotFound);
-        await ExpectStatus(HttpMethod.Post, $"{path}/reject", otherStaff, HttpStatusCode.NotFound);
+        await ExpectStatus(HttpMethod.Post, $"{path}/reject", otherStaff, HttpStatusCode.NotFound, new { reason = "A proposed reason." });
+        await ExpectStatus(HttpMethod.Put, $"{path}/rejection-reason", claimant, HttpStatusCode.Forbidden, new { reason = "A proposed reason." });
         await ExpectStatus(HttpMethod.Post, $"{path}/approve", claimant, HttpStatusCode.Forbidden);
         await CheckStatus(HttpMethod.Post, $"{path}/approve", staff, "Approved");
         await ExpectStatus(HttpMethod.Post, $"{path}/settle", otherStaff, HttpStatusCode.NotFound);
@@ -255,6 +382,105 @@ public sealed class ClaimsWorkflowTests : IClassFixture<ClaimsApiFactory>
         var entry = Assert.Single((await Read(history)).EnumerateArray(), eventEntry =>
             eventEntry.GetProperty("action").GetString() == "QuestionAsked");
         Assert.Equal(message.GetProperty("id").GetInt64(), entry.GetProperty("claimMessageId").GetInt64());
+    }
+
+    [Fact]
+    public async Task Staff_report_counts_open_claims_and_estimates_without_exposing_claim_details()
+    {
+        var claimant = await Token("claimant");
+        var staff = await Token("staff");
+        var otherStaff = await Token("other-staff");
+        using var beforeResponse = await Request(HttpMethod.Get, "/reports/overview?days=7", staff);
+        Assert.Equal(HttpStatusCode.OK, beforeResponse.StatusCode);
+        var before = await Read(beforeResponse);
+        await ExpectStatus(HttpMethod.Get, "/reports/overview", claimant, HttpStatusCode.Forbidden);
+        await ExpectStatus(HttpMethod.Get, "/reports/overview?days=1", staff, HttpStatusCode.BadRequest);
+
+        await ExpectStatus(HttpMethod.Post, "/claims", claimant, HttpStatusCode.BadRequest,
+            new { type = "Motor", incidentDate = DateOnly.FromDateTime(DateTime.UtcNow), description = "Missing currency", requestedAmount = 100 });
+        using var requested = await Request(HttpMethod.Post, "/claims", claimant, new
+        {
+            type = "Motor", incidentDate = DateOnly.FromDateTime(DateTime.UtcNow),
+            description = "Damage to a motor vehicle.", requestedAmount = 1800.50m, requestedCurrency = "MYR"
+        });
+        Assert.Equal(HttpStatusCode.Created, requested.StatusCode);
+        var requestedClaim = await Read(requested);
+        var firstId = requestedClaim.GetProperty("id").GetGuid();
+        Assert.Equal(180050, requestedClaim.GetProperty("requestedAmountMinor").GetInt64());
+        var first = $"/claims/{firstId}";
+        await CheckStatus(HttpMethod.Post, $"{first}/pick-up", staff, "UnderReview");
+        await ExpectStatus(HttpMethod.Get, $"{first}/exposure", claimant, HttpStatusCode.Forbidden);
+        await ExpectStatus(HttpMethod.Put, $"{first}/exposure", otherStaff, HttpStatusCode.NotFound,
+            new { amount = 2000, currency = "MYR" });
+        await ExpectStatus(HttpMethod.Put, $"{first}/exposure", staff, HttpStatusCode.BadRequest,
+            new { amount = 1250.255m, currency = "MYR" });
+        await ExpectStatus(HttpMethod.Put, $"{first}/exposure", staff, HttpStatusCode.OK,
+            new { amount = 1250.25m, currency = "MYR" });
+        await ExpectStatus(HttpMethod.Post, $"{first}/approve", otherStaff, HttpStatusCode.NotFound,
+            new { amount = 1432.10m, currency = "SGD" });
+        await ExpectStatus(HttpMethod.Post, $"{first}/approve", staff, HttpStatusCode.BadRequest,
+            new { amount = -1, currency = "SGD" });
+        await ExpectStatus(HttpMethod.Post, $"{first}/approve", staff, HttpStatusCode.OK,
+            new { amount = 1432.10m, currency = "SGD" });
+        using var ownerView = await Request(HttpMethod.Get, first, claimant);
+        Assert.Equal(143210, (await Read(ownerView)).GetProperty("approvedAmountMinor").GetInt64());
+
+        var second = $"/claims/{await Submit(claimant)}";
+        await CheckStatus(HttpMethod.Post, $"{second}/pick-up", otherStaff, "UnderReview");
+        await ExpectStatus(HttpMethod.Put, $"{second}/exposure", otherStaff, HttpStatusCode.OK,
+            new { amount = 875, currency = "SGD" });
+        await ExpectStatus(HttpMethod.Post, $"{second}/reject", otherStaff, HttpStatusCode.OK,
+            new { reason = "The reported damage is outside the policy period." });
+        await ExpectStatus(HttpMethod.Put, $"{second}/exposure", otherStaff, HttpStatusCode.Conflict,
+            new { amount = 300, currency = "SGD" });
+        _ = await Submit(claimant);
+
+        using var afterResponse = await Request(HttpMethod.Get, "/reports/overview?days=7", staff);
+        Assert.Equal(HttpStatusCode.OK, afterResponse.StatusCode);
+        var after = await Read(afterResponse);
+        Assert.Equal(7, after.GetProperty("days").GetInt32());
+        Assert.Equal(before.GetProperty("openClaims").GetInt32() + 2, after.GetProperty("openClaims").GetInt32());
+        Assert.Equal(before.GetProperty("missingExposure").GetInt32() + 1, after.GetProperty("missingExposure").GetInt32());
+        var exposure = Assert.Single(after.GetProperty("exposure").EnumerateArray());
+        Assert.Equal("MYR", exposure.GetProperty("currency").GetString());
+        Assert.Equal(125025, exposure.GetProperty("amountMinor").GetInt64());
+        Assert.Equal(1, exposure.GetProperty("claims").GetInt32());
+
+        var beforeDecisions = before.GetProperty("staff").EnumerateArray().Sum(row => row.GetProperty("decisions").GetInt32());
+        var afterDecisions = after.GetProperty("staff").EnumerateArray().Sum(row => row.GetProperty("decisions").GetInt32());
+        Assert.Equal(beforeDecisions + 2, afterDecisions);
+        Assert.DoesNotContain("description", after.GetRawText(), StringComparison.OrdinalIgnoreCase);
+
+        var date = DateOnly.FromDateTime(DateTime.UtcNow.AddDays(-90));
+        var endOfDate = date.ToDateTime(TimeOnly.MaxValue, DateTimeKind.Utc);
+        await using (var scope = factory.Services.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<ClaimsDbContext>();
+            await db.Claims.Where(claim => claim.Id == firstId)
+                .ExecuteUpdateAsync(change => change.SetProperty(claim => claim.CreatedAt, endOfDate));
+        }
+        await ExpectStatus(HttpMethod.Get, $"/reports/overview?startDate={date:yyyy-MM-dd}", staff, HttpStatusCode.BadRequest);
+        await ExpectStatus(HttpMethod.Get,
+            $"/reports/overview?startDate={date.AddDays(1):yyyy-MM-dd}&endDate={date:yyyy-MM-dd}", staff, HttpStatusCode.BadRequest);
+        using var custom = await Request(HttpMethod.Get,
+            $"/reports/overview?startDate={date:yyyy-MM-dd}&endDate={date:yyyy-MM-dd}", staff);
+        Assert.Equal(HttpStatusCode.OK, custom.StatusCode);
+        var filtered = await Read(custom);
+        Assert.Equal(1, filtered.GetProperty("totalClaims").GetInt32());
+        var requestedTotal = Assert.Single(filtered.GetProperty("requested").EnumerateArray());
+        Assert.Equal("MYR", requestedTotal.GetProperty("currency").GetString());
+        Assert.Equal(180050, requestedTotal.GetProperty("amountMinor").GetInt64());
+        var approvedTotal = Assert.Single(filtered.GetProperty("approved").EnumerateArray());
+        Assert.Equal("SGD", approvedTotal.GetProperty("currency").GetString());
+        Assert.Equal(143210, approvedTotal.GetProperty("amountMinor").GetInt64());
+        Assert.All(filtered.GetProperty("staff").EnumerateArray(), row => Assert.Equal(0, row.GetProperty("decisions").GetInt32()));
+
+        using var history = await Request(HttpMethod.Get, $"{first}/history", staff);
+        Assert.Contains((await Read(history)).EnumerateArray(), entry =>
+            entry.GetProperty("action").GetString() == "ExposureUpdated");
+        using var claimantHistory = await Request(HttpMethod.Get, $"{first}/history", claimant);
+        Assert.DoesNotContain((await Read(claimantHistory)).EnumerateArray(), entry =>
+            entry.GetProperty("action").GetString() == "ExposureUpdated");
     }
 
     private async Task<JsonElement> CheckStatus(HttpMethod method, string path, string token, string expected, string? message = null)

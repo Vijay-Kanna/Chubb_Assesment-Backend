@@ -2,9 +2,14 @@ namespace Claims.Api.Domain;
 
 public enum ClaimStatus { Submitted, UnderReview, AwaitingInformation, Approved, Rejected, Settled }
 public enum ClaimType { Motor, Property }
+public enum ExposureCurrency { MYR, SGD, AUD, HKD, NZD, USD }
+
+public sealed record ClaimAmount(long AmountMinor, ExposureCurrency Currency);
 
 public sealed class Claim
 {
+    public const int MaxRejectionReasonLength = 1000;
+
     private Claim() { }
 
     public Guid Id { get; private set; }
@@ -17,8 +22,16 @@ public sealed class Claim
     public DateTime CreatedAt { get; private set; }
     public DateTime UpdatedAt { get; private set; }
     public int Version { get; private set; }
+    public long? EstimatedExposureMinor { get; private set; }
+    public ExposureCurrency? EstimatedExposureCurrency { get; private set; }
+    public string? RejectionReason { get; private set; }
+    public long? RequestedAmountMinor { get; private set; }
+    public ExposureCurrency? RequestedCurrency { get; private set; }
+    public long? ApprovedAmountMinor { get; private set; }
+    public ExposureCurrency? ApprovedCurrency { get; private set; }
 
-    public static Claim Submit(Guid claimantId, ClaimType type, DateOnly incidentDate, string description, DateTime now) =>
+    public static Claim Submit(Guid claimantId, ClaimType type, DateOnly incidentDate, string description, DateTime now,
+        ClaimAmount? requested = null) =>
         new()
         {
             Id = Guid.NewGuid(),
@@ -28,7 +41,9 @@ public sealed class Claim
             Description = description,
             Status = ClaimStatus.Submitted,
             CreatedAt = now,
-            UpdatedAt = now
+            UpdatedAt = now,
+            RequestedAmountMinor = requested?.AmountMinor,
+            RequestedCurrency = requested?.Currency
         };
 
     public bool TryPickUp(Guid staffId, DateTime now)
@@ -45,11 +60,49 @@ public sealed class Claim
 
     public bool TryReply(DateTime now) => TryMove(ClaimStatus.AwaitingInformation, ClaimStatus.UnderReview, now);
 
-    public bool TryApprove(DateTime now) => TryMove(ClaimStatus.UnderReview, ClaimStatus.Approved, now);
+    public bool TryApprove(DateTime now, ClaimAmount? approved = null)
+    {
+        if (!TryMove(ClaimStatus.UnderReview, ClaimStatus.Approved, now))
+            return false;
 
-    public bool TryReject(DateTime now) => TryMove(ClaimStatus.UnderReview, ClaimStatus.Rejected, now);
+        ApprovedAmountMinor = approved?.AmountMinor;
+        ApprovedCurrency = approved?.Currency;
+        return true;
+    }
+
+    public bool TryReject(string reason, DateTime now)
+    {
+        if (!TryMove(ClaimStatus.UnderReview, ClaimStatus.Rejected, now))
+            return false;
+
+        RejectionReason = reason;
+        return true;
+    }
+
+    public bool TryRecordMissingRejectionReason(string reason, DateTime now)
+    {
+        if (Status != ClaimStatus.Rejected || RejectionReason is not null)
+            return false;
+
+        RejectionReason = reason;
+        UpdateVersion(now);
+        return true;
+    }
 
     public bool TrySettle(DateTime now) => TryMove(ClaimStatus.Approved, ClaimStatus.Settled, now);
+
+    public bool TrySetExposure(long amountMinor, ExposureCurrency currency, DateTime now)
+    {
+        if (AssignedStaffId is null || Status is ClaimStatus.Rejected or ClaimStatus.Settled)
+            return false;
+        if (EstimatedExposureMinor == amountMinor && EstimatedExposureCurrency == currency)
+            return true;
+
+        EstimatedExposureMinor = amountMinor;
+        EstimatedExposureCurrency = currency;
+        UpdateVersion(now);
+        return true;
+    }
 
     private bool TryMove(ClaimStatus requiredStatus, ClaimStatus nextStatus, DateTime now)
     {
@@ -63,6 +116,11 @@ public sealed class Claim
     private void MoveTo(ClaimStatus status, DateTime now)
     {
         Status = status;
+        UpdateVersion(now);
+    }
+
+    private void UpdateVersion(DateTime now)
+    {
         UpdatedAt = now;
         Version++;
     }

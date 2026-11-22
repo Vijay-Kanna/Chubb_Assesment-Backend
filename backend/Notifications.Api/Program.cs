@@ -1,7 +1,10 @@
 using System.IdentityModel.Tokens.Jwt;
 using System.Security.Claims;
+using Chubb.ApiDocumentation;
+using Chubb.Realtime;
 using Claims.Contracts;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
+using Microsoft.AspNetCore.SignalR;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Options;
 using Microsoft.IdentityModel.Tokens;
@@ -12,10 +15,13 @@ namespace Notifications.Api;
 
 public sealed class Program
 {
+    private const string ApiTitle = "Notifications API";
+
     public static async Task Main(string[] args)
     {
         var builder = WebApplication.CreateBuilder(args);
         builder.Services.AddProblemDetails();
+        builder.Services.AddAssessmentOpenApi(ApiTitle);
         builder.Services.AddDbContext<NotificationsDbContext>((services, options) =>
         {
             var config = services.GetRequiredService<IConfiguration>();
@@ -24,10 +30,12 @@ public sealed class Program
             options.UseSqlite(config.GetConnectionString("Notifications") ?? $"Data Source={database}");
         });
         builder.Services.AddHostedService<ClaimNotificationConsumer>();
+        builder.Services.AddSignalR();
+        builder.Services.AddSingleton<IUserIdProvider, SubjectUserIdProvider>();
 
         builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme).AddJwtBearer();
         builder.Services.AddOptions<JwtBearerOptions>(JwtBearerDefaults.AuthenticationScheme)
-            .Configure<IConfiguration>(ConfigureBearer);
+            .Configure<IConfiguration, IHostEnvironment>(ConfigureBearer);
         builder.Services.AddAuthorization();
 
         var app = builder.Build();
@@ -44,8 +52,15 @@ public sealed class Program
         });
         app.UseAuthentication();
         app.UseAuthorization();
+        app.UseAssessmentSwagger(ApiTitle);
+        app.MapHub<NotificationsHub>(NotificationsHub.Path, options => options.CloseOnAuthenticationExpiration = true);
 
         app.MapGet("/notifications", ListNotifications)
+            .WithDescription("Set pageSize to receive the matching notification count in X-Total-Count.")
+            .WithTags("Notifications")
+            .WithSummary("List notifications for the signed-in claimant")
+            .Produces<NotificationView[]>()
+            .ProducesValidationProblem()
             .RequireAuthorization(policy => policy.RequireRole("Claimant"));
 
         _ = app.Services.GetRequiredService<IOptionsMonitor<JwtBearerOptions>>().Get(JwtBearerDefaults.AuthenticationScheme);
@@ -55,25 +70,26 @@ public sealed class Program
         await app.RunAsync();
     }
 
-    private static async Task<IResult> ListNotifications(ClaimsPrincipal user, NotificationsDbContext db,
-        CancellationToken cancellationToken, int page = 1)
+    private static async Task<IResult> ListNotifications(HttpContext context, ClaimsPrincipal user, NotificationsDbContext db,
+        CancellationToken cancellationToken, int page = 1, int? pageSize = null)
     {
-        if (page is < 1 or > 10000)
-            return Results.ValidationProblem(new Dictionary<string, string[]> { ["page"] = ["Enter a page from 1 to 10000."] });
+        var window = new PageWindow(page, pageSize ?? PageWindow.DefaultSize);
+        if (!window.IsValid)
+            return Results.ValidationProblem(window.ValidationErrors());
 
         var recipient = Guid.Parse(user.FindFirstValue(JwtRegisteredClaimNames.Sub)!);
-        var notifications = await db.Notifications.AsNoTracking()
-            .Where(notification => notification.RecipientUserId == recipient)
-            .OrderByDescending(notification => notification.CreatedAt).ThenBy(notification => notification.EventId)
-            .Skip((page - 1) * 50).Take(50).ToListAsync(cancellationToken);
-
-        return Results.Ok(notifications.Select(notification => new
+        var query = db.Notifications.AsNoTracking().Where(notification => notification.RecipientUserId == recipient);
+        if (pageSize.HasValue)
         {
-            notification.EventId,
-            notification.ClaimId,
-            notification.Type,
-            notification.CreatedAt,
-            Message = notification.Type switch
+            var total = await query.CountAsync(cancellationToken);
+            context.Response.Headers[PageWindow.TotalHeader] = total.ToString(System.Globalization.CultureInfo.InvariantCulture);
+        }
+        var notifications = await query.OrderByDescending(notification => notification.CreatedAt).ThenBy(notification => notification.EventId)
+            .Skip(window.Offset).Take(window.Size).ToListAsync(cancellationToken);
+
+        return Results.Ok(notifications.Select(notification => new NotificationView(
+            notification.EventId, notification.ClaimId, notification.Type, notification.CreatedAt,
+            notification.Type switch
             {
                 ClaimNotificationType.QuestionAsked => "More information requested.",
                 ClaimNotificationType.Approved => "Your claim was approved.",
@@ -81,10 +97,10 @@ public sealed class Program
                 ClaimNotificationType.Settled => "Your claim was settled.",
                 _ => "Your claim was updated."
             }
-        }));
+        )));
     }
 
-    private static void ConfigureBearer(JwtBearerOptions options, IConfiguration configuration)
+    private static void ConfigureBearer(JwtBearerOptions options, IConfiguration configuration, IHostEnvironment environment)
     {
         var configuredKey = configuration["Jwt:SigningKey"];
         if (string.IsNullOrWhiteSpace(configuredKey))
@@ -113,6 +129,8 @@ public sealed class Program
         };
         options.Events = new JwtBearerEvents
         {
+            OnMessageReceived = context => RealtimeAuthentication.ReadToken(context, NotificationsHub.Path,
+                configuration["BrowserSession:Origin"], environment.IsDevelopment()),
             OnTokenValidated = context =>
             {
                 if (!Guid.TryParse(context.Principal?.FindFirst(JwtRegisteredClaimNames.Sub)?.Value, out _))
@@ -121,4 +139,7 @@ public sealed class Program
             }
         };
     }
+
+    private sealed record NotificationView(Guid EventId, Guid ClaimId, ClaimNotificationType Type,
+        DateTime CreatedAt, string Message);
 }

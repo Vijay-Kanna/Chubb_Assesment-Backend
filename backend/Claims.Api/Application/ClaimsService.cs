@@ -6,21 +6,22 @@ using Microsoft.EntityFrameworkCore;
 
 namespace Claims.Api.Application;
 
-internal sealed class ClaimsService(ClaimsDbContext db, TimeProvider clock)
+internal sealed class ClaimsService(ClaimsDbContext db, TimeProvider clock, ClaimUpdates updates)
 {
     public async Task<ClaimView> SubmitAsync(Guid claimantId, ClaimType type, DateOnly incidentDate,
-        string description, CancellationToken cancellationToken)
+        string description, CancellationToken cancellationToken, ClaimAmount? requested = null)
     {
         var now = clock.GetUtcNow().UtcDateTime;
-        var claim = Claim.Submit(claimantId, type, incidentDate, description, now);
+        var claim = Claim.Submit(claimantId, type, incidentDate, description, now, requested);
         db.Claims.Add(claim);
         AddHistory(claim, claimantId, ClaimAction.Submitted, previousStatus: null, now);
         await db.SaveChangesAsync(cancellationToken);
+        await updates.PublishAsync(claimantId);
         return ClaimView.From(claim);
     }
 
-    public async Task<IReadOnlyList<ClaimView>> ListAsync(Guid userId, bool isStaff, ClaimStatus? status,
-        Guid? assignedStaffId, int page, CancellationToken cancellationToken)
+    public async Task<PageItems<ClaimView>> ListAsync(Guid userId, bool isStaff, ClaimStatus? status,
+        Guid? assignedStaffId, PageWindow page, bool includeTotal, CancellationToken cancellationToken)
     {
         var query = VisibleClaims(userId, isStaff);
         if (status is not null)
@@ -28,10 +29,11 @@ internal sealed class ClaimsService(ClaimsDbContext db, TimeProvider clock)
         if (assignedStaffId is not null)
             query = query.Where(claim => claim.AssignedStaffId == assignedStaffId);
 
+        int? total = includeTotal ? await query.CountAsync(cancellationToken) : null;
         var claims = await query.OrderByDescending(claim => claim.CreatedAt).ThenBy(claim => claim.Id)
-            .Skip((page - 1) * 50).Take(50).ToListAsync(cancellationToken);
+            .Skip(page.Offset).Take(page.Size).ToListAsync(cancellationToken);
 
-        return claims.Select(ClaimView.From).ToList();
+        return new(claims.Select(ClaimView.From).ToList(), total);
     }
 
     public async Task<ClaimView?> GetAsync(Guid id, Guid userId, bool isStaff, CancellationToken cancellationToken)
@@ -40,31 +42,74 @@ internal sealed class ClaimsService(ClaimsDbContext db, TimeProvider clock)
         return claim is null ? null : ClaimView.From(claim);
     }
 
-    public async Task<IReadOnlyList<HistoryView>?> HistoryAsync(Guid id, Guid userId, bool isStaff,
-        CancellationToken cancellationToken)
+    public async Task<PageItems<HistoryView>?> HistoryAsync(Guid id, Guid userId, bool isStaff,
+        PageWindow? page, CancellationToken cancellationToken)
     {
         var authorizedClaim = VisibleClaims(userId, isStaff).Where(claim => claim.Id == id);
-        var entries = await db.ClaimHistory.AsNoTracking()
+        var history = db.ClaimHistory.AsNoTracking()
             .Where(entry => authorizedClaim.Any(claim => claim.Id == entry.ClaimId))
-            .OrderBy(entry => entry.Id)
-            .Select(entry => new HistoryView(entry.Id, entry.ActorUserId, entry.Action, entry.PreviousStatus,
-                entry.NewStatus, entry.OccurredAt, entry.ClaimMessageId))
-            .ToListAsync(cancellationToken);
+            .Where(entry => isStaff || entry.Action != ClaimAction.ExposureUpdated);
 
-        // Every submitted claim has a history entry, committed with the claim.
-        return entries.Count == 0 ? null : entries;
+        // Every visible claim has a submission entry, including when the requested page is empty.
+        int? total = page.HasValue ? await history.CountAsync(cancellationToken) : null;
+        if (total == 0)
+            return null;
+
+        var query = page is { } window
+            ? history.OrderByDescending(entry => entry.Id).Skip(window.Offset).Take(window.Size)
+            : history.OrderBy(entry => entry.Id);
+        var entries = await query.Select(entry => new HistoryView(entry.Id, entry.ActorUserId, entry.Action,
+            entry.PreviousStatus, entry.NewStatus, entry.OccurredAt, entry.ClaimMessageId)).ToListAsync(cancellationToken);
+
+        return total is null && entries.Count == 0 ? null : new(entries, total);
     }
 
-    public async Task<IReadOnlyList<ClaimMessageView>?> MessagesAsync(Guid id, Guid userId, bool isStaff,
-        CancellationToken cancellationToken)
-    {
-        return await ParticipantClaims(userId, isStaff).AsNoTracking()
-            .Where(claim => claim.Id == id)
-            .Select(claim => db.ClaimMessages.Where(message => message.ClaimId == claim.Id)
-                .OrderBy(message => message.Id)
-                .Select(message => new ClaimMessageView(message.Id, message.SenderUserId, message.Body, message.SentAt))
-                .ToList())
+    public Task<ExposureEstimate?> GetExposureAsync(Guid id, Guid staffId, CancellationToken cancellationToken) =>
+        ParticipantClaims(staffId, isStaff: true).AsNoTracking().Where(claim => claim.Id == id)
+            .Select(claim => new ExposureEstimate(claim.EstimatedExposureMinor, claim.EstimatedExposureCurrency))
             .SingleOrDefaultAsync(cancellationToken);
+
+    public async Task<ClaimChange> SetExposureAsync(Guid id, Guid staffId, long amountMinor,
+        ExposureCurrency currency, CancellationToken cancellationToken)
+    {
+        var claim = await ParticipantClaims(staffId, isStaff: true)
+            .SingleOrDefaultAsync(claim => claim.Id == id, cancellationToken);
+        if (claim is null)
+            return new(ClaimChangeOutcome.NotFound);
+
+        var version = claim.Version;
+        var now = clock.GetUtcNow().UtcDateTime;
+        if (!claim.TrySetExposure(amountMinor, currency, now))
+            return new(ClaimChangeOutcome.Conflict);
+        if (claim.Version == version)
+            return new(ClaimChangeOutcome.Changed, ClaimView.From(claim));
+
+        AddHistory(claim, staffId, ClaimAction.ExposureUpdated, claim.Status, now);
+        return await SaveChangeAsync(claim, cancellationToken);
+    }
+
+    public async Task<PageItems<ClaimMessageView>?> MessagesAsync(Guid id, Guid userId, bool isStaff,
+        PageWindow? page, long? throughMessageId, CancellationToken cancellationToken)
+    {
+        var participant = ParticipantClaims(userId, isStaff).AsNoTracking().Where(claim => claim.Id == id);
+        if (!await participant.AnyAsync(cancellationToken))
+            return null;
+
+        var messages = db.ClaimMessages.AsNoTracking()
+            .Where(message => participant.Any(claim => claim.Id == message.ClaimId));
+        if (throughMessageId is { } lastId)
+            messages = messages.Where(message => message.Id <= lastId);
+        int? total = page.HasValue ? await messages.CountAsync(cancellationToken) : null;
+        var query = page is { } window
+            ? messages.OrderByDescending(message => message.Id).Skip(window.Offset).Take(window.Size)
+            : messages.OrderBy(message => message.Id);
+        var entries = await query.Select(message => new ClaimMessageView(message.Id, message.SenderUserId,
+            message.Body, message.SentAt)).ToListAsync(cancellationToken);
+
+        if (page.HasValue)
+            entries.Reverse();
+
+        return new(entries, total);
     }
 
     public async Task<ClaimChange> PickUpAsync(Guid id, Guid staffId,
@@ -84,7 +129,7 @@ internal sealed class ClaimsService(ClaimsDbContext db, TimeProvider clock)
     }
 
     public async Task<ClaimChange> ReviewAsync(Guid id, Guid actorId, ClaimAction action, string? body,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken, ClaimAmount? approved = null)
     {
         var claim = await ParticipantClaims(actorId, isStaff: action != ClaimAction.ReplyReceived)
             .SingleOrDefaultAsync(claim => claim.Id == id, cancellationToken);
@@ -97,21 +142,22 @@ internal sealed class ClaimsService(ClaimsDbContext db, TimeProvider clock)
         {
             ClaimAction.QuestionAsked => claim.TryAskQuestion(now),
             ClaimAction.ReplyReceived => claim.TryReply(now),
-            ClaimAction.Approved => claim.TryApprove(now),
-            ClaimAction.Rejected => claim.TryReject(now),
+            ClaimAction.Approved => claim.TryApprove(now, approved),
+            ClaimAction.Rejected => body is not null && claim.TryReject(body, now),
             ClaimAction.Settled => claim.TrySettle(now),
+            ClaimAction.RejectionReasonRecorded => body is not null && claim.TryRecordMissingRejectionReason(body, now),
             _ => throw new ArgumentOutOfRangeException(nameof(action))
         };
         if (!changed)
             return new(ClaimChangeOutcome.Conflict);
 
-        var message = body is null ? null : new ClaimMessage
+        var message = action is ClaimAction.QuestionAsked or ClaimAction.ReplyReceived ? new ClaimMessage
         {
             ClaimId = id,
             SenderUserId = actorId,
-            Body = body,
+            Body = body!,
             SentAt = now
-        };
+        } : null;
         AddHistory(claim, actorId, action, previousStatus, now, message);
         QueueNotification(claim, action, now);
         return await SaveChangeAsync(claim, cancellationToken);
@@ -150,6 +196,7 @@ internal sealed class ClaimsService(ClaimsDbContext db, TimeProvider clock)
             return new(ClaimChangeOutcome.Conflict);
         }
 
+        await updates.PublishAsync(claim.ClaimantId);
         return new(ClaimChangeOutcome.Changed, ClaimView.From(claim));
     }
 
@@ -186,13 +233,18 @@ internal enum ClaimChangeOutcome { Changed, NotFound, Conflict }
 internal sealed record ClaimChange(ClaimChangeOutcome Outcome, ClaimView? Claim = null);
 
 internal sealed record ClaimView(Guid Id, Guid ClaimantId, Guid? AssignedStaffId, ClaimType Type,
-    DateOnly IncidentDate, string Description, ClaimStatus Status, DateTime CreatedAt, DateTime UpdatedAt)
+    DateOnly IncidentDate, string Description, ClaimStatus Status, DateTime CreatedAt, DateTime UpdatedAt,
+    string? RejectionReason, long? RequestedAmountMinor, ExposureCurrency? RequestedCurrency,
+    long? ApprovedAmountMinor, ExposureCurrency? ApprovedCurrency)
 {
     public static ClaimView From(Claim claim) => new(claim.Id, claim.ClaimantId, claim.AssignedStaffId, claim.Type,
-        claim.IncidentDate, claim.Description, claim.Status, claim.CreatedAt, claim.UpdatedAt);
+        claim.IncidentDate, claim.Description, claim.Status, claim.CreatedAt, claim.UpdatedAt, claim.RejectionReason,
+        claim.RequestedAmountMinor, claim.RequestedCurrency, claim.ApprovedAmountMinor, claim.ApprovedCurrency);
 }
 
 internal sealed record HistoryView(long Id, Guid ActorUserId, ClaimAction Action, ClaimStatus? PreviousStatus,
     ClaimStatus NewStatus, DateTime OccurredAt, long? ClaimMessageId);
 
 internal sealed record ClaimMessageView(long Id, Guid SenderUserId, string Body, DateTime SentAt);
+
+internal sealed record ExposureEstimate(long? AmountMinor, ExposureCurrency? Currency);
